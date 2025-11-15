@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 import argparse, time, json, requests, concurrent.futures
 from datetime import datetime, timezone
+from dotenv import load_dotenv, find_dotenv
+import os
 
 API_BASE = "https://console.vast.ai/api/v0"
+load_dotenv(find_dotenv(), override=False)
+
+
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
@@ -48,11 +53,11 @@ def fetch_one(target: str, token: str, timeout=3.0):
 def main():
     ap = argparse.ArgumentParser(description="Central Nock proof-rate monitor")
     ap.add_argument("--targets", help="Comma-separated list of ip:port")
-    ap.add_argument("--discover_vast", action="store_true")
-    ap.add_argument("--api-key", default="")
-    ap.add_argument("--label-prefix", default="deal-snipe")
+    ap.add_argument("--discover_vast", action="store_true", default=True)
+    ap.add_argument("--api-key", default=os.getenv('API_KEY'))
+    ap.add_argument("--label-prefix", default="nock-exporter")
     ap.add_argument("--exporter-port", type=int, default=9108)
-    ap.add_argument("--token", default="")
+    ap.add_argument("--token", default=os.getenv('NOCK_EXPORTER_TOKEN','putsncalls23'))
     ap.add_argument("--interval", type=int, default=15)
     ap.add_argument("--workers", type=int, default=32)
     args = ap.parse_args()

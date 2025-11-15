@@ -1,18 +1,39 @@
 #!/usr/bin/env python3
+"""
+Push-only Nock miner exporter.
+- tails miner log (or a systemd unit)
+- computes median proofs/sec over a sliding window
+- samples GPU util/power via nvidia-smi
+- periodically POSTs JSON to a central collector
+
+Default collector: http://78.46.165.58:9000/ingest
+Auth header: X-Token (optional)
+"""
+
 import argparse, json, os, re, sys, time, threading, subprocess
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import deque
 
-# ----------- regex patterns -----------
+# ---------------- HTTP client (stdlib only) ----------------
+import urllib.request, urllib.error
+
+def http_post(url: str, headers: dict, payload: dict, timeout: float = 3.0) -> int:
+    data = json.dumps(payload).encode("utf-8")
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.getcode()
+
+# ---------------- Utilities ----------------
 RE_PPS_1 = re.compile(r'(?i)\b([0-9]+(?:\.[0-9]+)?)\s*(?:p/s|proofs?/s)\b')
 RE_PPS_2 = re.compile(r'(?i)\b(?:proof\s*rate|proof_rate)\b[^0-9]*([0-9]+(?:\.[0-9]+)?)')
-RE_KPM   = re.compile(r'(?i)\b([0-9]+(?:\.[0-9]+)?)\s*k[p]?/m\b')  # Kp/m → p/s
+RE_KPM   = re.compile(r'(?i)\b([0-9]+(?:\.[0-9]+)?)\s*k[p]?/m\b')   # Kp/m → p/s
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
 
-# ----------- sliding window tracker -----------
 class RateTracker:
     def __init__(self, window_sec=120):
         self.window = window_sec
@@ -41,20 +62,21 @@ class RateTracker:
     def snapshot(self):
         with self.lock:
             now = time.time()
-            vals = [v for _, v in self.samples if now - _ <= self.window]
+            vals = [v for t, v in self.samples if now - t <= self.window]
             med = (sorted(vals)[len(vals)//2] if vals else None)
             age = now - self.last_line_at if self.last_line_at else None
             return {"median_pps": med, "n": len(vals), "age_sec": age}
 
-# ----------- tailers -----------
 def tail_journal(unit: str, cb):
-    # follow new lines from "now"
     cmd = ["journalctl", "-u", unit, "-f", "-o", "cat", "--since", "now"]
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) as p:
         for line in p.stdout:
             cb(line.rstrip("\n"))
 
 def tail_file(path: str, cb):
+    # wait for file to appear if miner starts slightly later
+    while not os.path.exists(path):
+        time.sleep(0.5)
     with open(path, "r", errors="replace") as f:
         f.seek(0, os.SEEK_END)
         while True:
@@ -63,7 +85,6 @@ def tail_file(path: str, cb):
                 time.sleep(0.1); continue
             cb(line.rstrip("\n"))
 
-# ----------- GPU sampler -----------
 def sample_gpu():
     try:
         out = subprocess.check_output(
@@ -87,87 +108,34 @@ def sample_gpu():
     except Exception:
         return []
 
-# ----------- HTTP server -----------
-class Metrics:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.data = {
-            "time": ts(),
-            "proof_rate": {"median_pps": None, "n": 0, "age_sec": None},
-            "gpus": [],    # list of dicts from sample_gpu()
-            "meta": {},    # user-supplied tags
-        }
-
-    def update(self, pr_snapshot=None, gpus=None, meta=None):
-        with self.lock:
-            if pr_snapshot is not None:
-                self.data["proof_rate"] = pr_snapshot
-            if gpus is not None:
-                self.data["gpus"] = gpus
-            if meta:
-                self.data["meta"].update(meta)
-            self.data["time"] = ts()
-
-    def get(self):
-        with self.lock:
-            return dict(self.data)
-
-def run_http(metrics: Metrics, host: str, port: int, token: str):
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            # simple token check in header or query ?token=
-            ok = False
-            if token:
-                auth = self.headers.get("X-Token")
-                if auth == token:
-                    ok = True
-                else:
-                    # parse query
-                    if "?" in self.path:
-                        try:
-                            q = dict(x.split("=",1) for x in self.path.split("?",1)[1].split("&"))
-                            ok = (q.get("token") == token)
-                        except Exception:
-                            ok = False
-            else:
-                ok = True
-
-            if not ok:
-                self.send_response(401); self.end_headers(); return
-
-            if self.path.startswith("/metrics.json") or self.path.startswith("/"):
-                body = json.dumps(metrics.get()).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type","application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            else:
-                self.send_response(404); self.end_headers()
-
-        def log_message(self, fmt, *args):  # silence access log
-            return
-
-    httpd = HTTPServer((host, port), Handler)
-    httpd.serve_forever()
-
+# ---------------- Main ----------------
 def main():
-    ap = argparse.ArgumentParser(description="Nock miner exporter (proof rate + GPU util → HTTP JSON)")
+    ap = argparse.ArgumentParser(description="Nock miner exporter (push-only)")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--journal-unit", help="systemd unit to follow (e.g. nockpool-miner.service)")
-    src.add_argument("--log-file", help="file to tail")
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=9108)
-    ap.add_argument("--token", default=os.environ.get("NOCK_EXPORTER_TOKEN",""))
-    ap.add_argument("--window-sec", type=int, default=120)
-    ap.add_argument("--gpu-sample-sec", type=int, default=15)
-    ap.add_argument("--tag", default=os.environ.get("NOCK_TAG",""), help="free-form label (e.g. label/instance id)")
+    src.add_argument("--log-file", help="file to tail, e.g. /var/log/nockminer.log")
+
+    # proof-rate window & GPU sampling cadence
+    ap.add_argument("--window-sec", type=int, default=int(os.environ.get("WINDOW_SEC","120")))
+    ap.add_argument("--gpu-sample-sec", type=int, default=int(os.environ.get("GPU_SAMPLE_SEC","15")))
+
+    # push settings
+    ap.add_argument("--post-url", default=os.environ.get("MONITOR_URL","http://78.46.165.58:9000/ingest"),
+                    help="Collector endpoint to POST metrics JSON")
+    ap.add_argument("--post-token", default=os.environ.get("MONITOR_TOKEN",""),
+                    help="Shared secret sent as X-Token")
+    ap.add_argument("--post-interval", type=int, default=int(os.environ.get("POST_INTERVAL","30")),
+                    help="Seconds between pushes")
+
+    # identity / tagging
+    ap.add_argument("--node-id", default=os.environ.get("NODE_ID", os.environ.get("HOSTNAME","")),
+                    help="identifier for this miner (hostname/label/contract id)")
+    ap.add_argument("--tag", default=os.environ.get("NOCK_TAG",""),
+                    help="free-form label to include in meta")
+
     args = ap.parse_args()
 
     tracker = RateTracker(window_sec=args.window_sec)
-    metrics = Metrics()
-    if args.tag:
-        metrics.update(meta={"tag": args.tag})
 
     # tail thread
     t_tail = threading.Thread(
@@ -176,16 +144,41 @@ def main():
         daemon=True)
     t_tail.start()
 
-    # GPU sampler loop
-    def gpu_loop():
-        while True:
-            g = sample_gpu()
-            metrics.update(pr_snapshot=tracker.snapshot(), gpus=g)
-            time.sleep(args.gpu_sample_sec)
-    threading.Thread(target=gpu_loop, daemon=True).start()
+    # background sampler + push loop
+    headers = {}
+    if args.post_token:
+        headers["X-Token"] = args.post_token
 
-    # HTTP server
-    run_http(metrics, args.host, args.port, args.token)
+    ext_port = os.environ.get("VAST_TCP_PORT_9108")  # for debugging only; not required in push-mode
+
+    # lightweight state to include GPU stats at each push
+    def loop():
+        backoff = 1.0
+        while True:
+            try:
+                payload = {
+                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z"),
+                    "proof_rate": tracker.snapshot(),
+                    "gpus": sample_gpu(),
+                    "meta": {
+                        "node_id": args.node_id,
+                        "tag": args.tag,
+                        "source": "push-exporter",
+                        "exporter_ext_port": ext_port
+                    }
+                }
+                http_post(args.post_url, headers, payload, timeout=3.0)
+                backoff = 1.0  # reset on success
+            except Exception:
+                # exponential backoff on error, capped at 60s
+                backoff = min(backoff * 2.0, 60.0)
+            time.sleep(max(args.post_interval, int(backoff)))
+
+    threading.Thread(target=loop, daemon=True).start()
+
+    # keep the process alive
+    while True:
+        time.sleep(3600)
 
 if __name__ == "__main__":
     main()
