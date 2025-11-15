@@ -1,0 +1,6 @@
+# Ignore all miners data, manifest_files and models
+docker/
+docs/
+data/
+__pycache__/
+.env
