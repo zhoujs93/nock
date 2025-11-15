@@ -4,3 +4,5 @@ docs/
 data/
 __pycache__/
 .env
+vast_sniper.py
+monitor_central.py
