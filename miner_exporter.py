@@ -27,9 +27,34 @@ def http_post(url: str, headers: dict, payload: dict, timeout: float = 3.0) -> i
         return resp.getcode()
 
 # ---------------- Utilities ----------------
-RE_PPS_1 = re.compile(r'(?i)\b([0-9]+(?:\.[0-9]+)?)\s*(?:p/s|proofs?/s)\b')
-RE_PPS_2 = re.compile(r'(?i)\b(?:proof\s*rate|proof_rate)\b[^0-9]*([0-9]+(?:\.[0-9]+)?)')
-RE_KPM   = re.compile(r'(?i)\b([0-9]+(?:\.[0-9]+)?)\s*k[p]?/m\b')   # Kp/m → p/s
+import re
+
+# strip ANSI color codes
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+# Accept common spellings: p/s, pps, proof/s, proofs/s, proof/sec, proofs/sec
+RE_PPS_ANY = re.compile(
+    r'(?ix)\b'
+    r'([0-9]+(?:\.[0-9]+)?)'
+    r'\s*'
+    r'(?:'
+    r'pps'                                   # "pps"
+    r'|p\s*/\s*s'                            # "p/s"
+    r'|proofs?\s*/\s*(?:s|sec)'              # "proof/s", "proofs/s", "proof/sec", "proofs/sec"
+    r')\b'
+)
+
+# Also handle phrases like "mining rate: 12.3", "proof rate 10.1"
+RE_RATE_WORDS = re.compile(
+    r'(?ix)'
+    r'(?:mining\s*rate|proof(?:s)?(?:\s*per\s*sec(?:ond)?)?|proof[_\s]*rate)'
+    r'\D*'
+    r'([0-9]+(?:\.[0-9]+)?)'
+)
+
+# Keep your Kp/m fallback (K proofs per minute)
+RE_KPM = re.compile(r'(?i)\b([0-9]+(?:\.[0-9]+)?)\s*k[p]?/m\b')
+
 
 def ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
@@ -42,14 +67,22 @@ class RateTracker:
         self.last_line_at = 0.0
 
     def observe(self, line: str):
+        # remove ANSI escape sequences to avoid breaking regex matches
+        clean = ANSI_RE.sub('', line)
+
         pps = None
-        m = RE_PPS_1.search(line) or RE_PPS_2.search(line)
+        m = RE_PPS_ANY.search(clean)
         if m:
             pps = float(m.group(1))
         else:
-            m = RE_KPM.search(line)
+            m = RE_RATE_WORDS.search(clean)
             if m:
-                pps = float(m.group(1)) * 1000.0 / 60.0
+                pps = float(m.group(1))
+            else:
+                m = RE_KPM.search(clean)
+                if m:
+                    pps = float(m.group(1)) * 1000.0 / 60.0  # Kp/m → p/s
+
         if pps is not None:
             now = time.time()
             with self.lock:
@@ -124,7 +157,7 @@ def main():
                     help="Collector endpoint to POST metrics JSON")
     ap.add_argument("--post-token", default=os.environ.get("MONITOR_TOKEN",""),
                     help="Shared secret sent as X-Token")
-    ap.add_argument("--post-interval", type=int, default=int(os.environ.get("POST_INTERVAL","30")),
+    ap.add_argument("--post-interval", type=int, default=int(os.environ.get("POST_INTERVAL","300")),
                     help="Seconds between pushes")
 
     # identity / tagging
