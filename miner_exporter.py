@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
 """
-Push-only Nock miner exporter.
-- tails miner log (or a systemd unit)
-- computes median proofs/sec over a sliding window
-- samples GPU util/power via nvidia-smi
-- periodically POSTs JSON to a central collector
+Push-only Nock miner exporter (CPU-fallback detection only).
 
-Default collector: http://78.46.165.58:9000/ingest
-Auth header: X-Token (optional)
+- Tails the miner's stdout/log (journal unit or a file)
+- Detects the line: "GPU mining disabled, using CPU mining" (ANSI stripped)
+- Periodically POSTs a minimal JSON to a central collector:
+    {
+      "time": "...",
+      "cpu_disabled": true|false|null,
+      "cpu_disabled_age_sec": <seconds or null>,
+      "backend": "cpu"|"gpu"|null,   # convenience field ("cpu" if cpu_disabled==True, "gpu" if False)
+      "meta": { "node_id": "...", "tag": "...", "source": "push-exporter" }
+    }
+
+Defaults:
+  POST URL: http://78.46.165.58:9000/ingest
+  Auth header: X-Token (optional)
+
+Notes:
+- We do NOT parse proof rates anymore.
+- We do NOT require any Vast port mappings (push model).
 """
 
 import argparse, json, os, re, sys, time, threading, subprocess
 from datetime import datetime, timezone
-from collections import deque
-
-# ---------------- HTTP client (stdlib only) ----------------
+from http.client import HTTPException
 import urllib.request, urllib.error
 
+# ---------- HTTP ----------
 def http_post(url: str, headers: dict, payload: dict, timeout: float = 3.0) -> int:
     data = json.dumps(payload).encode("utf-8")
     hdrs = {"Content-Type": "application/json"}
@@ -26,88 +37,24 @@ def http_post(url: str, headers: dict, payload: dict, timeout: float = 3.0) -> i
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.getcode()
 
-# ---------------- Utilities ----------------
-import re
-
-# strip ANSI color codes
+# ---------- Utils ----------
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+RE_CPU_DISABLED = re.compile(r'GPU\s+mining\s+disabled,\s+using\s+CPU\s+mining', re.I)
+RE_CPU_THREADS  = re.compile(r'\bmining\s+with\s+\d+\s+threads\b', re.I)  # optional corroboration
 
-# Accept common spellings: p/s, pps, proof/s, proofs/s, proof/sec, proofs/sec
-RE_PPS_ANY = re.compile(
-    r'(?ix)\b'
-    r'([0-9]+(?:\.[0-9]+)?)'
-    r'\s*'
-    r'(?:'
-    r'pps'                                   # "pps"
-    r'|p\s*/\s*s'                            # "p/s"
-    r'|proofs?\s*/\s*(?:s|sec)'              # "proof/s", "proofs/s", "proof/sec", "proofs/sec"
-    r')\b'
-)
-
-# Also handle phrases like "mining rate: 12.3", "proof rate 10.1"
-RE_RATE_WORDS = re.compile(
-    r'(?ix)'
-    r'(?:mining\s*rate|proof(?:s)?(?:\s*per\s*sec(?:ond)?)?|proof[_\s]*rate)'
-    r'\D*'
-    r'([0-9]+(?:\.[0-9]+)?)'
-)
-
-# Keep your Kp/m fallback (K proofs per minute)
-RE_KPM = re.compile(r'(?i)\b([0-9]+(?:\.[0-9]+)?)\s*k[p]?/m\b')
-
-
-def ts():
+def ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
 
-class RateTracker:
-    def __init__(self, window_sec=120):
-        self.window = window_sec
-        self.lock = threading.Lock()
-        self.samples = deque()  # (t, pps)
-        self.last_line_at = 0.0
-
-    def observe(self, line: str):
-        # remove ANSI escape sequences to avoid breaking regex matches
-        clean = ANSI_RE.sub('', line)
-
-        pps = None
-        m = RE_PPS_ANY.search(clean)
-        if m:
-            pps = float(m.group(1))
-        else:
-            m = RE_RATE_WORDS.search(clean)
-            if m:
-                pps = float(m.group(1))
-            else:
-                m = RE_KPM.search(clean)
-                if m:
-                    pps = float(m.group(1)) * 1000.0 / 60.0  # Kp/m → p/s
-
-        if pps is not None:
-            now = time.time()
-            with self.lock:
-                self.samples.append((now, pps))
-                self.last_line_at = now
-                cutoff = now - self.window
-                while self.samples and self.samples[0][0] < cutoff:
-                    self.samples.popleft()
-
-    def snapshot(self):
-        with self.lock:
-            now = time.time()
-            vals = [v for t, v in self.samples if now - t <= self.window]
-            med = (sorted(vals)[len(vals)//2] if vals else None)
-            age = now - self.last_line_at if self.last_line_at else None
-            return {"median_pps": med, "n": len(vals), "age_sec": age}
-
+# ---------- Tailers ----------
 def tail_journal(unit: str, cb):
+    # journalctl -f from "now"
     cmd = ["journalctl", "-u", unit, "-f", "-o", "cat", "--since", "now"]
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1) as p:
         for line in p.stdout:
             cb(line.rstrip("\n"))
 
 def tail_file(path: str, cb):
-    # wait for file to appear if miner starts slightly later
+    # wait until file exists (miner might start after exporter)
     while not os.path.exists(path):
         time.sleep(0.5)
     with open(path, "r", errors="replace") as f:
@@ -118,100 +65,113 @@ def tail_file(path: str, cb):
                 time.sleep(0.1); continue
             cb(line.rstrip("\n"))
 
-def sample_gpu():
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi",
-             "--query-gpu=name,index,utilization.gpu,utilization.memory,power.draw,temperature.gpu",
-             "--format=csv,noheader,nounits"],
-            text=True, timeout=2.5).strip().splitlines()
-        gpus = []
-        for row in out:
-            parts = [p.strip() for p in row.split(",")]
-            if len(parts) >= 6:
-                gpus.append({
-                    "name": parts[0],
-                    "index": int(parts[1]),
-                    "gpu_util": float(parts[2]),
-                    "mem_util": float(parts[3]),
-                    "power_w": float(parts[4]),
-                    "temp_c": float(parts[5]),
-                })
-        return gpus
-    except Exception:
-        return []
+# ---------- Minimal state ----------
+class CpuFallbackTracker:
+    """
+    Tracks whether we've seen the explicit CPU-fallback line.
+    Once seen, 'cpu_disabled' stays True for this exporter lifetime.
+    On container restart (exporter restart), state resets to unknown.
+    """
+    def __init__(self):
+        self.cpu_disabled = None     # None=unknown, True=CPU-only, False=not observed
+        self.cpu_disabled_at = 0.0
+        self.last_line_at = 0.0
+        self.lock = threading.Lock()
 
-# ---------------- Main ----------------
+    def observe(self, line: str):
+        clean = ANSI_RE.sub('', line)
+        now = time.time()
+        with self.lock:
+            self.last_line_at = now
+            if self.cpu_disabled is not True:
+                if RE_CPU_DISABLED.search(clean) or RE_CPU_THREADS.search(clean):
+                    self.cpu_disabled = True
+                    self.cpu_disabled_at = now
+            # If you WANT to mark an explicit "gpu" mode, you could add a positive signal here.
+            # Per your request, we do not; absence of the CPU line => treat as False at push time.
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            # If we haven't seen the CPU line yet, report False (i.e., assume GPU path)
+            # If you prefer strict "unknown" until a decision, set to None instead.
+            cpu = self.cpu_disabled if self.cpu_disabled is not None else False
+            age = (time.time() - self.cpu_disabled_at) if (self.cpu_disabled_at > 0) else None
+            backend = ("cpu" if cpu else "gpu") if cpu is not None else None
+            return {
+                "cpu_disabled": cpu,
+                "cpu_disabled_age_sec": age,
+                "backend": backend
+            }
+
+# ---------- Main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Nock miner exporter (push-only)")
+    ap = argparse.ArgumentParser(description="Nock miner exporter (CPU-fallback only, push-mode)")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--journal-unit", help="systemd unit to follow (e.g. nockpool-miner.service)")
     src.add_argument("--log-file", help="file to tail, e.g. /var/log/nockminer.log")
 
-    # proof-rate window & GPU sampling cadence
-    ap.add_argument("--window-sec", type=int, default=int(os.environ.get("WINDOW_SEC","120")))
-    ap.add_argument("--gpu-sample-sec", type=int, default=int(os.environ.get("GPU_SAMPLE_SEC","15")))
-
     # push settings
-    ap.add_argument("--post-url", default=os.environ.get("MONITOR_URL","http://78.46.165.58:9000/ingest"),
-                    help="Collector endpoint to POST metrics JSON")
+    ap.add_argument("--post-url", default=os.environ.get("MONITOR_URL","http://78.46.165.58:9100/ingest"),
+                    help="Collector endpoint to POST JSON")
     ap.add_argument("--post-token", default=os.environ.get("MONITOR_TOKEN",""),
                     help="Shared secret sent as X-Token")
-    ap.add_argument("--post-interval", type=int, default=int(os.environ.get("POST_INTERVAL","300")),
-                    help="Seconds between pushes")
+    ap.add_argument("--post-interval", type=int, default=int(os.environ.get("POST_INTERVAL","30")),
+                    help="Seconds between pushes (default 30)")
 
     # identity / tagging
-    ap.add_argument("--node-id", default=os.environ.get("NODE_ID", os.environ.get("HOSTNAME","")),
+    default_node = os.environ.get("NODE_ID") or os.environ.get("HOSTNAME") or ""
+    ap.add_argument("--node-id", default=default_node,
                     help="identifier for this miner (hostname/label/contract id)")
     ap.add_argument("--tag", default=os.environ.get("NOCK_TAG",""),
                     help="free-form label to include in meta")
 
     args = ap.parse_args()
 
-    tracker = RateTracker(window_sec=args.window_sec)
+    tracker = CpuFallbackTracker()
 
     # tail thread
+    tail_target = args.journal_unit if args.journal_unit else args.log_file
     t_tail = threading.Thread(
         target=tail_journal if args.journal_unit else tail_file,
-        args=((args.journal_unit or args.log_file), tracker.observe),
+        args=(tail_target, tracker.observe),
         daemon=True)
     t_tail.start()
 
-    # background sampler + push loop
+    # push loop
     headers = {}
     if args.post_token:
         headers["X-Token"] = args.post_token
 
-    ext_port = os.environ.get("VAST_TCP_PORT_9108")  # for debugging only; not required in push-mode
-
-    # lightweight state to include GPU stats at each push
     def loop():
         backoff = 1.0
         while True:
-            try:
-                payload = {
-                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z"),
-                    "proof_rate": tracker.snapshot(),
-                    "gpus": sample_gpu(),
-                    "meta": {
-                        "node_id": args.node_id,
-                        "tag": args.tag,
-                        "source": "push-exporter",
-                        "exporter_ext_port": ext_port
-                    }
+            snap = tracker.snapshot()
+            payload = {
+                "time": ts(),
+                "cpu_disabled": snap["cpu_disabled"],
+                "cpu_disabled_age_sec": snap["cpu_disabled_age_sec"],
+                "backend": snap["backend"],
+                "meta": {
+                    "node_id": args.node_id,
+                    "tag": args.tag,
+                    "source": "push-exporter"
                 }
+            }
+            try:
                 http_post(args.post_url, headers, payload, timeout=3.0)
-                backoff = 1.0  # reset on success
+                backoff = 1.0
             except Exception:
-                # exponential backoff on error, capped at 60s
-                backoff = min(backoff * 2.0, 60.0)
-            time.sleep(max(args.post_interval, int(backoff)))
+                backoff = min(backoff * 2.0, 60.0)  # gentle backoff on collector hiccups
+            time.sleep(max(3, int(args.post_interval)))  # don’t spam the collector
 
     threading.Thread(target=loop, daemon=True).start()
 
-    # keep the process alive
-    while True:
-        time.sleep(3600)
+    # keep process alive
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
     main()
