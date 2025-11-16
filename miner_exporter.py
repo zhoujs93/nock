@@ -115,7 +115,7 @@ def main():
                     help="Collector endpoint to POST JSON")
     ap.add_argument("--post-token", default=os.environ.get("MONITOR_TOKEN",""),
                     help="Shared secret sent as X-Token")
-    ap.add_argument("--post-interval", type=int, default=int(os.environ.get("POST_INTERVAL","30")),
+    ap.add_argument("--post-interval", type=int, default=int(os.environ.get("POST_INTERVAL","3600")),
                     help="Seconds between pushes (default 30)")
 
     # identity / tagging
