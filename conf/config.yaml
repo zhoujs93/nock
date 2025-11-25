@@ -1,0 +1,123 @@
+# Required
+api_key: "990a1991f5d838312da63a25a1d3d9fecb6bc4de41cd4eb6c419fc59b3d96a01"
+# Use a template hash OR a template id
+template_hash_id: "9fdba1fd887b45a98e542aa49b8b1f38"   # preferred
+# template_id: 123456
+
+# Offer selection
+series: [30, 40, 50]
+gpu_models:
+  - "RTX 3080"
+  - "RTX 3080 Ti"
+  - "RTX 3090"
+  - "RTX 3090 Ti"
+  - "RTX 4080"
+  - "RTX 4080 Super"
+  - "RTX 4090"
+  - "RTX 4090D"
+  - "RTX 5070"
+  - "RTX 5070 Ti"
+  - "RTX 5070 Super"
+  - "RTX 5070 Ti Super"
+  - "RTX 5080"
+  - "RTX 5080 Super"
+  - "RTX 5090"
+  - "RTX 5090D"
+
+# Which models should use the OD-min fallback policy
+sparse_models:
+  - "RTX 4070"
+  - "RTX 4070 Super"
+  - "RTX 4070 Ti"
+  - "RTX 4080"
+  - "RTX 4080 Super"
+  - "RTX 5070"
+  - "RTX 5070 Ti"
+  - "RTX 5070 Super"
+  - "RTX 5070 Ti Super"
+  - "RTX 5080"
+  - "RTX 5080 Super"
+  - "RTX 5090"
+  - "RTX 5090D"
+
+countries: ["US", "CA"]
+regions: ["NORTH AMERICA", "EUROPE"]
+min_reliability: 0.95
+min_cuda: 12.6
+instance_type: "bid"      # "bid" | "on-demand" | "reserved"
+limit: 200
+poll_sec: 12              # add a little jitter internally
+window_min: 120
+discount: 0.25            # require ≥25% off rolling BID median
+max_dph: 0.0
+print_top: 15
+
+# how many samples are "enough" to trust a median
+min_samples_per_baseline_bid: 8
+min_samples_per_baseline_od: 8
+# if we fall back to OD, how far below OD median must the price be
+od_anchor_frac: 0.90     # allow deals priced ≤ 90% of OD median
+# Accept if BID price_per_gpu <= sparse_od_min_frac * (current OD min for that model)
+sparse_od_min_frac: 1.00      # 1.00 = at or below OD min; 0.98 = strictly below
+# If you want to auto-trigger sparse policy when sample counts are tiny:
+sparse_min_total_samples: 20  # use OD-min policy if (n_bid + n_od) < this
+
+# Capacity & behavior
+auto_rent: true
+exit_after_rent: false
+max_instances: 150
+active_states: ["running", "starting", "restarting"]
+label_prefix: "deal-snipe"
+
+# Rebid ladder (preempt/outbid)
+rebid_on_preempt: true
+rebid_steps: [1.00, 1.02, 1.05]
+rebid_max_frac_od: 0.85
+rebid_interval_sec: 60
+warmup_sec: 120
+bid_jitter: 5e-5
+
+# GPU count filters
+min_gpus_per_offer: 1
+max_gpus_per_offer: 6
+only_30_for_multi: false
+
+# Cleaner (price-only)
+min_discount_keep: 0.2   # keep only if still ≥10% below current median
+max_dph_keep: 0.0         # if >0, hard cap TOTAL $/h per instance
+clean_action: "delete"    # "delete" | "stop"
+clean_every_loops: 1
+
+# Detail/telemetry (optional)
+clean_batch_per_loop: 16
+detail_batch_per_loop: 6
+detail_min_delay_sec: 0.6
+telemetry_url: "http://127.0.0.1:9100/"
+telemetry_timeout: 3.0
+cpu_fallback_hold_sec: 90
+log_level: "INFO"
+
+# Stuck-state timers + actions
+outbid_hold_sec: 1800      # 30m in OUTBID -> action
+scheduling_hold_sec: 600   # 10m in SCHEDULING -> action
+on_outbid_action: "kill"   # "keep" | "kill" | "rebid"
+on_sched_action: "kill"    # "keep" | "kill"
+
+# Per-endpoint rate limits (requests per second)
+rate_limits:
+  bundles_rps: 2.5          # POST /bundles
+  instances_get_rps: 3.0    # GET /instances, /instances/{id}
+  asks_put_rps: 2.0         # PUT /asks/{id}
+  instances_put_rps: 2.0    # PUT /instances/bid_price, /instances/{id}
+  instances_delete_rps: 1.5 # DELETE /instances/{id}
+
+db_path: "./data/vast_prices.duckdb"
+
+# Sniping burst
+# renting behaviour
+rents_per_loop: 1        # number of *successes* you want per loop
+burst_top_k: 6           # concurrent attempts per wave
+burst_waves: 1           # waves per loop if attempt_all_deals is false
+attempt_all_deals: true # if true: walk the entire deals list this loop
+overshoot_kill: true     # cancel extra successes immediately
+ask_410_cooldown_sec: 45 # don't re-touch a 410 ask for this many seconds
